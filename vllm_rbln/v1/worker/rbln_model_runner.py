@@ -2189,6 +2189,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.scheduler_config.enable_chunked_prefill
             else self.model_config.max_model_len
         )
+        # leave room for the sampled token
+        prefill_seq_len = min(prefill_seq_len, self.model_config.max_model_len - 1)
         dummy_prefill_requests: list[NewRequestData] = []
         dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
         self._add_dummy_requests(
@@ -2362,6 +2364,10 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             round_up(total_tokens, self.cache_config.block_size)
             // self.cache_config.block_size
         ) + extra_blocks
+        # never exceed the block table width
+        num_blocks = min(
+            num_blocks, cdiv(self.max_model_len, self.cache_config.block_size)
+        )
         prompt_token_ids = list(range(total_tokens))
         # the dummy block maintained by BlockPool (null_block)
         null_block_id = 0
