@@ -1324,6 +1324,15 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
+        # the kernel adds this before the scale, so pre-divide
+        self.alibi_bias_per_head = (
+            None
+            if alibi_slopes is None
+            else (
+                alibi_slopes.reshape(1, num_kv_heads, num_heads // num_kv_heads, 1, 1)
+                / scale
+            )
+        )
         self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
         if logits_soft_cap is None:
@@ -1649,8 +1658,20 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 assert attn_metadata.seq_lens is not None
                 assert attn_metadata.block_tables is not None
 
+                # only the triton kernel has an additive variant
+                _bias = (
+                    self.alibi_bias_per_head is not None
+                    and envs.VLLM_RBLN_USE_CUSTOM_KERNEL
+                )
                 if envs.VLLM_RBLN_COMPILE_MODEL:
-                    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                    if _bias:
+                        attention_naive_prefill = (
+                            torch.ops.rbln_triton_ops.additive_attention_naive_prefill
+                        )
+                        attention_naive_decode = (
+                            torch.ops.rbln_triton_ops.additive_attention_naive_decode
+                        )
+                    elif envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                         attention_naive_prefill = (
                             torch.ops.rbln_triton_ops.attention_naive_prefill
                         )
@@ -1665,13 +1686,28 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                             torch.ops.rbln_custom_ops.attention_naive_decode
                         )
 
+                if _bias:
+                    # the floor stays finite: the kernel rebuilds the keep-mask
+                    # as exp(x - x), and -inf would give NaN.
+                    _key_pos = torch.arange(
+                        kv_cache.shape[-2], dtype=torch.float32
+                    ).reshape(1, 1, 1, 1, -1)
+                    _mask = (
+                        ((attn_metadata.attn_masks - 1.0) * 1e4).expand(
+                            -1, query.shape[1], query.shape[2], -1, -1
+                        )
+                        + self.alibi_bias_per_head * _key_pos
+                    ).contiguous()
+                else:
+                    _mask = attn_metadata.attn_masks
+
                 if not attn_metadata.is_prefill:
                     decode_args = [
                         query,
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.attn_masks,
+                        _mask,
                         attn_metadata.seq_lens,
                         self.scale,
                         attn_metadata.block_tables,
@@ -1688,7 +1724,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         key,
                         value,
                         kv_cache,
-                        attn_metadata.attn_masks,
+                        _mask,
                         attn_metadata.seq_lens,
                         self.scale,
                         attn_metadata.block_tables,
