@@ -1310,11 +1310,22 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         if kv_sharing_target_layer_name is not None:
             raise NotImplementedError("KV sharing is not supported in RBLN.")
+        # the softcap kernels only exist on the triton path
+        self.softcap = None
+        if logits_soft_cap:
+            if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                self.softcap = torch.tensor(
+                    float(logits_soft_cap), dtype=torch.float32
+                )
+                self.scale_over_cap = torch.tensor(
+                    scale / logits_soft_cap, dtype=torch.float32
+                )
+            else:
+                logger.warning_once(
+                    "RBLN Attention Backend does not support logits soft cap "
+                    "on this path. Outputs may be slightly off."
+                )
         if logits_soft_cap is not None:
-            logger.warning_once(
-                "RBLN Attention Backend does not support logits soft cap. "
-                "Outputs may be slightly off."
-            )
             logits_soft_cap = None
 
         self.num_heads = num_heads
@@ -1477,8 +1488,16 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             )
             assert attn_metadata.cache_seq_lens is not None
             assert attn_metadata.cache_offsets is not None
+            _cap = self.softcap is not None
             if envs.VLLM_RBLN_COMPILE_MODEL:
-                if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                if _cap:
+                    sliding_window_attention_naive_prefill = (
+                        torch.ops.rbln_triton_ops.softcap_swa_attention_naive_prefill
+                    )
+                    sliding_window_attention_naive_decode = (
+                        torch.ops.rbln_triton_ops.softcap_swa_attention_naive_decode
+                    )
+                elif envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     sliding_window_attention_naive_prefill = (
                         torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill
                     )
@@ -1508,9 +1527,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     kv_cache,
                     attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
-                    self.scale,
+                    self.scale_over_cap if _cap else self.scale,
                     attn_metadata.local_block_tables,
-                    self.scale,  # dummy
+                    self.softcap if _cap else self.scale,  # dummy / cap
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     if self.is_batch_attention_opt and b_size > 1:
@@ -1529,9 +1548,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     kv_cache,
                     attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
-                    self.scale,
+                    self.scale_over_cap if _cap else self.scale,
                     attn_metadata.local_block_tables,
-                    self.scale,  # dummy
+                    self.softcap if _cap else self.scale,  # dummy / cap
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     prefill_args.append(self.sinks)
@@ -1663,8 +1682,16 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     self.alibi_bias_per_head is not None
                     and envs.VLLM_RBLN_USE_CUSTOM_KERNEL
                 )
+                _cap = self.softcap is not None
                 if envs.VLLM_RBLN_COMPILE_MODEL:
-                    if _bias:
+                    if _cap:
+                        attention_naive_prefill = (
+                            torch.ops.rbln_triton_ops.softcap_attention_naive_prefill
+                        )
+                        attention_naive_decode = (
+                            torch.ops.rbln_triton_ops.softcap_attention_naive_decode
+                        )
+                    elif _bias:
                         attention_naive_prefill = (
                             torch.ops.rbln_triton_ops.additive_attention_naive_prefill
                         )
@@ -1709,9 +1736,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         _mask,
                         attn_metadata.seq_lens,
-                        self.scale,
+                        self.scale_over_cap if _cap else self.scale,
                         attn_metadata.block_tables,
-                        self.scale,  # dummy (required by rbln_triton_ops signature)
+                        self.softcap if _cap else self.scale,  # dummy / cap
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                         decode_args.append(self.sinks)
@@ -1726,9 +1753,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         _mask,
                         attn_metadata.seq_lens,
-                        self.scale,
+                        self.scale_over_cap if _cap else self.scale,
                         attn_metadata.block_tables,
-                        self.scale,  # dummy (required by rbln_triton_ops signature)
+                        self.softcap if _cap else self.scale,  # dummy / cap
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                         prefill_args.append(self.sinks)

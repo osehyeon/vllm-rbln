@@ -63,6 +63,10 @@ def register_ops():
         from vllm_rbln.triton_kernels import attention  # noqa
         from vllm_rbln.triton_kernels import additive_attention  # noqa
         from vllm_rbln.triton_kernels import causal_attention  # noqa
+        from vllm_rbln.triton_kernels import softcap_attention  # noqa
+        from vllm_rbln.triton_kernels import (  # noqa
+            softcap_sliding_window_attention,
+        )
         from vllm_rbln.triton_kernels import flash_attention  # noqa
         from vllm_rbln.triton_kernels import flash_causal_attention  # noqa
         from vllm_rbln.triton_kernels import sliding_window_attention  # noqa
