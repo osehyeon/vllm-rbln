@@ -18,9 +18,9 @@ tanh so no single key can dominate:
 
     tanh(z / cap) * cap
 
-The kernel cannot hold a literal, and rebel's triton has no tanh, so the host
-folds scale/cap into qk_scale and cap into the unused dummy slot, and the tanh
-is synthesised from exp with no constants at all.
+rebel's triton has no tanh and the kernel cannot hold a literal, so the cap
+rides the slot the stock kernel leaves unused, as a Pade correction. Building
+tanh from exp instead loses its mantissa on small scores.
 """
 
 import torch
@@ -41,7 +41,7 @@ def softcap_attention_naive_prefill(
     seq_idx_base,
     qk_scale,
     block_table_base,
-    dummy,
+    cap_scale,
     NUM_HEAD: tl.constexpr,
     NUM_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -197,13 +197,18 @@ def softcap_attention_naive_prefill(
         k = tl.broadcast_to(k, (1, NUM_HEAD, NUM_GROUP, HEAD_DIM, PARTITION_SIZE))
         # 2.1 a = MM(Q, Kt)
         qk = tl.dot(q, k)  # (1,h,g,l,d) x (1,h,g,d,p) = (1,h,g,l,p)
-        # 2.2 b = a * qk_scale
-        # tanh(qk * scale/cap) * cap, built without a single literal:
-        # x + x is 2x, and exp(x - x) is a 1.0 tensor
-        t = qk * qk_scale
-        e = tl.exp(t + t)
-        one = tl.exp(t - t)
-        qk_scaled = ((e - one) / (e + one)) * dummy  # (1,h,g,l,p)
+        # 2.2 b = a * qk_scale, capped
+        # Pade [3/2]: cap*tanh(z/cap) = z - z*5w/(1+6w), w = t^2/15.
+        # cap_scale is scale/(cap*sqrt(15)), so w is a multiply and a square.
+        z = qk * qk_scale
+        y = qk * cap_scale
+        w = y * y
+        one = tl.exp(y - y)
+        two = one + one
+        four = two + two
+        five = four + one
+        six = four + two
+        qk_scaled = z - z * (five * w) / (one + six * w)  # (1,h,g,l,p)
         attn_mask = tl.load(attn_mask_ptr)  # (1,1,g,l,p)
         # 2.3 c = b + attention_mask
         # 2.4 d = softmax(c)
@@ -237,7 +242,7 @@ def softcap_attention_naive_decode(
     seq_idx_base,
     qk_scale,
     block_table_base,
-    dummy,
+    cap_scale,
     NUM_HEAD: tl.constexpr,
     NUM_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -393,13 +398,18 @@ def softcap_attention_naive_decode(
         k = tl.broadcast_to(k, (1, NUM_HEAD, NUM_GROUP, HEAD_DIM, PARTITION_SIZE))
         # 2.1 a = MM(Q, Kt)
         qk = tl.dot(q, k)  # (1,h,g,l,d) x (1,h,g,d,p) = (1,h,g,l,p)
-        # 2.2 b = a * qk_scale
-        # tanh(qk * scale/cap) * cap, built without a single literal:
-        # x + x is 2x, and exp(x - x) is a 1.0 tensor
-        t = qk * qk_scale
-        e = tl.exp(t + t)
-        one = tl.exp(t - t)
-        qk_scaled = ((e - one) / (e + one)) * dummy
+        # 2.2 b = a * qk_scale, capped
+        # Pade [3/2]: cap*tanh(z/cap) = z - z*5w/(1+6w), w = t^2/15.
+        # cap_scale is scale/(cap*sqrt(15)), so w is a multiply and a square.
+        z = qk * qk_scale
+        y = qk * cap_scale
+        w = y * y
+        one = tl.exp(y - y)
+        two = one + one
+        four = two + two
+        five = four + one
+        six = four + two
+        qk_scaled = z - z * (five * w) / (one + six * w)
         attn_mask = tl.load(attn_mask_ptr)
         # 2.3 c = b + attention_mask
         # 2.4 d = softmax(c)
@@ -439,7 +449,7 @@ def softcap_attention_naive_prefill_wrapper(
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     original_dtype = query.dtype
 
@@ -498,7 +508,7 @@ def softcap_attention_naive_decode_wrapper(
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     original_dtype = query.dtype
 
@@ -558,7 +568,7 @@ def _(
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)
 
@@ -573,6 +583,6 @@ def _(
     seq_idx: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)

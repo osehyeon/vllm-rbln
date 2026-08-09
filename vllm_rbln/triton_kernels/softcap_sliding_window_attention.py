@@ -13,10 +13,8 @@
 # limitations under the License.
 """Sliding-window attention with logit softcapping.
 
-Derived from sliding_window_attention.py. Same trick as softcap_attention.py:
-the host folds scale/cap into qk_scale and cap into the unused dummy slot, and
-tanh is synthesised from exp because rebel's triton has neither tanh nor
-in-kernel literals.
+Derived from sliding_window_attention.py, with the same Pade correction as
+softcap_attention.py.
 """
 
 import torch
@@ -37,7 +35,7 @@ def softcap_swa_attention_naive_prefill(
     cache_offset_base,
     qk_scale,
     block_table_base,  # 1D vector, block_tables[batch]
-    dummy,
+    cap_scale,
     NUM_HEAD: tl.constexpr,
     NUM_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -196,12 +194,18 @@ def softcap_swa_attention_naive_prefill(
         )
         # 2.1 a = MM(Q, Kt)
         qk = tl.dot(q, k)  # (1,h,g,l,d) x (1,h,g,d,p) = (1,h,g,l,p)
-        # 2.2 b = a * qk_scale
-        # tanh(qk * scale/cap) * cap, built without a single literal
-        t = qk * qk_scale
-        e = tl.exp(t + t)
-        one = tl.exp(t - t)
-        qk_scaled = ((e - one) / (e + one)) * dummy  # (1,h,g,l,p)
+        # 2.2 b = a * qk_scale, capped
+        # Pade [3/2]: cap*tanh(z/cap) = z - z*5w/(1+6w), w = t^2/15.
+        # cap_scale is scale/(cap*sqrt(15)), so w is a multiply and a square.
+        z = qk * qk_scale
+        y = qk * cap_scale
+        w = y * y
+        one = tl.exp(y - y)
+        two = one + one
+        four = two + two
+        five = four + one
+        six = four + two
+        qk_scaled = z - z * (five * w) / (one + six * w)  # (1,h,g,l,p)
         # 2.3 c = window_softmax(b)
         window_qk_scaled = rblib.window_softmax(
             qk_scaled, cache_start, window_size=WINDOW_SIZE
@@ -235,7 +239,7 @@ def softcap_swa_attention_naive_decode(
     cache_offset_base,
     qk_scale,
     block_table_base,  # 2D vector, block_tables[batch][partition]
-    dummy,
+    cap_scale,
     NUM_HEAD: tl.constexpr,
     NUM_GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -401,12 +405,18 @@ def softcap_swa_attention_naive_decode(
         )
         # 2.1 a = MM(Q, Kt)
         qk = tl.dot(q, k)  # (1,h,g,l,d) x (1,h,g,d,p) = (1,h,g,l,p)
-        # 2.2 b = a * qk_scale
-        # tanh(qk * scale/cap) * cap, built without a single literal
-        t = qk * qk_scale
-        e = tl.exp(t + t)
-        one = tl.exp(t - t)
-        qk_scaled = ((e - one) / (e + one)) * dummy  # (1,h,g,l,p)
+        # 2.2 b = a * qk_scale, capped
+        # Pade [3/2]: cap*tanh(z/cap) = z - z*5w/(1+6w), w = t^2/15.
+        # cap_scale is scale/(cap*sqrt(15)), so w is a multiply and a square.
+        z = qk * qk_scale
+        y = qk * cap_scale
+        w = y * y
+        one = tl.exp(y - y)
+        two = one + one
+        four = two + two
+        five = four + one
+        six = four + two
+        qk_scaled = z - z * (five * w) / (one + six * w)  # (1,h,g,l,p)
         # 2.3 c = window_softmax(b)
         window_qk_scaled = rblib.window_softmax(
             qk_scaled, cache_start, window_size=WINDOW_SIZE
@@ -454,7 +464,7 @@ def softcap_swa_attention_naive_prefill_wrapper(
     cache_offset: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     original_dtype = query.dtype
 
@@ -514,7 +524,7 @@ def _(
     cache_offset: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)
 
@@ -529,7 +539,7 @@ def softcap_swa_attention_naive_decode_wrapper(
     cache_offset: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     original_dtype = query.dtype
 
@@ -589,6 +599,6 @@ def _(
     cache_offset: torch.Tensor,
     qk_scale: torch.Tensor,
     block_table: torch.Tensor,
-    dummy: torch.Tensor,
+    cap_scale: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(query)

@@ -16,6 +16,8 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import math
+
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.v1.attention.backend import (
@@ -1314,11 +1316,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.softcap = None
         if logits_soft_cap:
             if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                # the kernel squares this into w; qk_scale stays plain scale
                 self.softcap = torch.tensor(
-                    float(logits_soft_cap), dtype=torch.float32
-                )
-                self.scale_over_cap = torch.tensor(
-                    scale / logits_soft_cap, dtype=torch.float32
+                    scale / (logits_soft_cap * math.sqrt(15.0)),
+                    dtype=torch.float32,
                 )
             else:
                 logger.warning_once(
@@ -1527,9 +1528,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     kv_cache,
                     attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
-                    self.scale_over_cap if _cap else self.scale,
+                    self.scale,
                     attn_metadata.local_block_tables,
-                    self.softcap if _cap else self.scale,  # dummy / cap
+                    self.softcap if _cap else self.scale,  # dummy / cap_scale
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     if self.is_batch_attention_opt and b_size > 1:
@@ -1548,9 +1549,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     kv_cache,
                     attn_metadata.cache_seq_lens,
                     attn_metadata.cache_offsets,
-                    self.scale_over_cap if _cap else self.scale,
+                    self.scale,
                     attn_metadata.local_block_tables,
-                    self.softcap if _cap else self.scale,  # dummy / cap
+                    self.softcap if _cap else self.scale,  # dummy / cap_scale
                 ]
                 if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                     prefill_args.append(self.sinks)
@@ -1736,9 +1737,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         _mask,
                         attn_metadata.seq_lens,
-                        self.scale_over_cap if _cap else self.scale,
+                        self.scale,
                         attn_metadata.block_tables,
-                        self.softcap if _cap else self.scale,  # dummy / cap
+                        self.softcap if _cap else self.scale,  # dummy / cap_scale
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                         decode_args.append(self.sinks)
@@ -1753,9 +1754,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         kv_cache,
                         _mask,
                         attn_metadata.seq_lens,
-                        self.scale_over_cap if _cap else self.scale,
+                        self.scale,
                         attn_metadata.block_tables,
-                        self.softcap if _cap else self.scale,  # dummy / cap
+                        self.softcap if _cap else self.scale,  # dummy / cap_scale
                     ]
                     if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
                         prefill_args.append(self.sinks)
